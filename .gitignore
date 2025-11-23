@@ -1,6 +1,6 @@
 coco/
 original_outputs/
-output/
+output*/
 retro_outputs/
 sd_models/
 watermarked_outputs/
@@ -9,3 +9,7 @@ __pycache__/
 .github/
 models/
 src/loss/losses
+annotations_trainval2017.zip
+plot/
+log/
+annotations/

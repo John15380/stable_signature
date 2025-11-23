@@ -30,9 +30,8 @@ from ldm.models.autoencoder import AutoencoderKL
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from loss.loss_provider import LossProvider
 
-# ==================== GEMINI 修改：引入正确的模块 ====================
-from ldm.modules.diffusionmodules.model import AttnBlock 
-from src.lora import LoRAConv2d 
+# ==================== 注意：这里没有引入 LoRA 模块 ====================
+# from src.lora import LoRAConv2d  <-- 已移除
 # =================================================================
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -79,32 +78,6 @@ def get_parser():
     aa("--debug", type=utils.bool_inst, default=False, help="Debug mode")
 
     return parser
-
-
-# ==================== GEMINI 绝地反击版注入函数 ====================
-def inject_lora_into_decoder(model: nn.Module, rank=32, alpha=64):
-    """
-    递归遍历模型，将所有合适的 nn.Conv2d 层替换为 LoRAConv2d。
-    这次我们不再局限于 AttnBlock，而是覆盖所有卷积层！
-    """
-    for name, child in model.named_children():
-        # 如果是卷积层，且卷积核大小 > 1 (通常忽略 1x1 卷积以节省参数，也可以全加)
-        # 这里我们选择替换所有 3x3 卷积，这是 ResNet 的核心
-        if isinstance(child, nn.Conv2d):
-            # 排除掉一些特殊的 1x1 卷积，或者为了更强能力，全部替换
-            # 这里建议：只要是 Conv2d 就替换，保证能力最大化
-            print(f"  >>> Injecting LoRA into: {name} | Kernel: {child.kernel_size}")
-            
-            # 创建 LoRA 包装层
-            lora_layer = LoRAConv2d(child, rank=rank, alpha=alpha)
-            
-            # 替换原模块
-            setattr(model, name, lora_layer)
-        
-        else:
-            # 递归进入子模块 (比如 ResnetBlock)
-            inject_lora_into_decoder(child, rank, alpha)
-# =================================================================
 
 
 def main(params):
@@ -244,32 +217,17 @@ def main(params):
         ldm_decoder.encoder = nn.Identity()
         ldm_decoder.quant_conv = nn.Identity()
         ldm_decoder.to(device)
-
-        # ==================== GEMINI 修改：调用新的注入函数并设置优化器 ====================
-        print(">>> Dynamically injecting LoRA layers into the VAE decoder...")
-        inject_lora_into_decoder(ldm_decoder.decoder, rank=32, alpha=64)
-
-        # 遍历模型，找到所有LoRA参数并设置为可训练
-        params_to_train = []
-        trainable_params_count = 0
-        print("\n将在此次训练中更新的参数:")
-        for name, param in ldm_decoder.named_parameters():
-            # 原始的非LoRA参数保持冻结状态 (requires_grad = False)
-            if "lora" in name:
-                param.requires_grad = True
-                params_to_train.append(param)
-                print(f"  - {name}")
-                trainable_params_count += 1
         
-        if trainable_params_count == 0:
-            print("\n!!! 警告: 没有找到任何可训练的LoRA参数。请检查模型结构和注入逻辑。")
-        else:
-            print(f"\n成功找到并解冻 {trainable_params_count} 个LoRA参数。")
-
-        # 将只包含可训练参数的列表传递给优化器
+        # ==================== Baseline 核心设置：全量微调 ====================
+        print(">>> Baseline Mode: Fine-tuning the ENTIRE decoder (No LoRA).")
+        # 确保所有参数都参与训练
+        for param in ldm_decoder.decoder.parameters():
+            param.requires_grad = True
+        
+        # 优化器包含所有参数
         optim_params = utils.parse_params(params.optimizer)
-        optimizer = utils.build_optimizer(model_params=params_to_train, **optim_params)
-        # ==============================================================================
+        optimizer = utils.build_optimizer(model_params=ldm_decoder.decoder.parameters(), **optim_params)
+        # =================================================================
 
         # Training loop
         print(f'\n>>> Training...')
@@ -299,7 +257,11 @@ def train(data_loader: Iterable, optimizer: torch.optim.Optimizer, loss_w: Calla
     metric_logger = utils.MetricLogger(delimiter="  ")
     ldm_decoder.decoder.train()
     base_lr = optimizer.param_groups[0]["lr"]
+    
+    # ==================== BUG 修复：正确解包 ====================
     for ii, (imgs, _) in enumerate(metric_logger.log_every(data_loader, params.log_freq, header)):
+    # =========================================================
+        
         imgs = imgs.to(device)
         keys = key.repeat(imgs.shape[0], 1)
         
@@ -360,16 +322,14 @@ def val(data_loader: Iterable, ldm_ae: AutoencoderKL, ldm_decoder: AutoencoderKL
     metric_logger = utils.MetricLogger(delimiter="  ")
     ldm_decoder.decoder.eval()
     
-    # 我们改回最简单的写法，把处理逻辑放在循环里面
+    # ==================== BUG 修复：正确解包 ====================
     for ii, batch in enumerate(metric_logger.log_every(data_loader, params.log_freq, header)):
-        
-        # ========== GEMINI 强制修复逻辑 ==========
         # 自动判断 batch 是列表还是张量，防止解包错误
         if isinstance(batch, list) or isinstance(batch, tuple):
             imgs = batch[0]  # 如果是 [图片, 标签]，只取图片
         else:
             imgs = batch     # 如果已经是图片，直接用
-        # =======================================
+    # =========================================================
         
         imgs = imgs.to(device)
 

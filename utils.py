@@ -1,117 +1,155 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# utils.py (最终修复版 - 20251012)
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-import math
+import argparse
+import json
+import os
+import random
+import sys
 import time
 import datetime
-import os
-import subprocess
-import functools
-from collections import defaultdict, deque
-
+from copy import deepcopy
 import numpy as np
-from PIL import Image
-
 import torch
-from torch.utils.data import DataLoader, Subset
-from torchvision.datasets.folder import is_image_file, default_loader
+from torch.utils.data import DataLoader, Subset, Dataset
+from torchvision.datasets.vision import VisionDataset
+from PIL import Image
+from torchvision.datasets.folder import has_file_allowed_extension, IMG_EXTENSIONS
 
-### Optimizer building
+def make_dataset(directory, class_to_idx, extensions=None, is_valid_file=None):
+    """直接从根目录扫描图片文件，而不是从子目录。"""
+    instances = []
+    directory = os.path.expanduser(directory)
+    both_none = extensions is None and is_valid_file is None
+    both_something = extensions is not None and is_valid_file is not None
+    if both_none or both_something:
+        raise ValueError("Exactly one of extensions and is_valid_file must be passed. HINT: extensions is a tuple e.g. ('.jpg', '.png')")
+    if extensions is not None:
+        def is_valid_file(x):
+            return has_file_allowed_extension(x, extensions)
+    
+    cls_name = 'images'
+    cls_index = class_to_idx.get(cls_name, 0)
 
-def parse_params(s):
-    """
-    Parse parameters into a dictionary, used for optimizer and scheduler parsing.
-    Example: 
-        "SGD,lr=0.01" -> {"name": "SGD", "lr": 0.01}
-    """
-    s = s.replace(' ', '').split(',')
-    params = {}
-    params['name'] = s[0]
-    for x in s[1:]:
-        x = x.split('=')
-        params[x[0]]=float(x[1])
-    return params
+    for root, _, fnames in sorted(os.walk(directory, followlinks=True)):
+        if root != directory:
+            continue
+        for fname in sorted(fnames):
+            path = os.path.join(root, fname)
+            if is_valid_file(path):
+                item = path, cls_index
+                instances.append(item)
+    return instances
 
-def build_optimizer(name, model_params, **optim_params):
-    """ Build optimizer from a dictionary of parameters """
-    torch_optimizers = sorted(name for name in torch.optim.__dict__
-        if name[0].isupper() and not name.startswith("__")
-        and callable(torch.optim.__dict__[name]))
-    if hasattr(torch.optim, name):
-        return getattr(torch.optim, name)(model_params, **optim_params)
-    raise ValueError(f'Unknown optimizer "{name}", choose among {str(torch_optimizers)}')
+class SimpleImageFolder(VisionDataset):
+    """一个简化的ImageFolder，可以直接读取根目录下的图片，不需要子文件夹。"""
+    def __init__(self, root, transform=None, target_transform=None,
+                 loader=lambda path: Image.open(path).convert('RGB'),
+                 is_valid_file=None, extensions=IMG_EXTENSIONS):
+        super(SimpleImageFolder, self).__init__(root, transform=transform,
+                                           target_transform=target_transform)
+        classes = ['images']
+        class_to_idx = {'images': 0}
+        
+        samples = make_dataset(self.root, class_to_idx, extensions, is_valid_file)
+        if len(samples) == 0:
+            msg = f"Found 0 files in supplied directory: {self.root}\n"
+            if extensions is not None:
+                msg += f"Supported extensions are: {','.join(extensions)}"
+            raise RuntimeError(msg)
 
-def adjust_learning_rate(optimizer, step, steps, warmup_steps, blr, min_lr=1e-6):
-    """Decay the learning rate with half-cycle cosine after warmup"""
-    if step < warmup_steps:
-        lr = blr * step / warmup_steps 
-    else:
-        lr = min_lr + (blr - min_lr) * 0.5 * (1. + math.cos(math.pi * (step - warmup_steps) / (steps - warmup_steps)))
-    for param_group in optimizer.param_groups:
-        if "lr_scale" in param_group:
-            param_group["lr"] = lr * param_group["lr_scale"]
-        else:
-            param_group["lr"] = lr
-    return lr
-
-### Data loading
-
-@functools.lru_cache()
-def get_image_paths(path):
-    paths = []
-    for path, _, files in os.walk(path):
-        for filename in files:
-            paths.append(os.path.join(path, filename))
-    return sorted([fn for fn in paths if is_image_file(fn)])
-
-class ImageFolder:
-    """An image folder dataset intended for self-supervised learning."""
-
-    def __init__(self, path, transform=None, loader=default_loader):
-        self.samples = get_image_paths(path)
         self.loader = loader
-        self.transform = transform
+        self.extensions = extensions
+        self.classes = classes
+        self.class_to_idx = class_to_idx
+        self.samples = samples
+        self.targets = [s[1] for s in samples]
 
-    def __getitem__(self, idx: int):
-        assert 0 <= idx < len(self)
-        img = self.loader(self.samples[idx])
-        if self.transform:
-            return self.transform(img)
-        return img
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        return sample, target
 
     def __len__(self):
         return len(self.samples)
 
-def collate_fn(batch):
-    """ Collate function for data loader. Allows to have img of different size"""
-    return batch
+def get_dataloader(path, transform, batch_size, num_imgs=None, shuffle=False, num_workers=0, collate_fn=None):
+    # 使用我们自己的 SimpleImageFolder 替换官方的 ImageFolder
+    dataset = SimpleImageFolder(path, transform=transform)
 
-def get_dataloader(data_dir, transform, batch_size=128, num_imgs=None, shuffle=False, num_workers=4, collate_fn=collate_fn):
-    """ Get dataloader for the images in the data_dir. The data_dir must be of the form: input/0/... """
-    dataset = ImageFolder(data_dir, transform=transform)
-    if num_imgs is not None:
+    # 只有当请求的图片数量小于数据集总数时，才进行随机抽样。
+    if num_imgs is not None and num_imgs < len(dataset):
+        print(f">>> Subsampling dataset from {len(dataset)} to {num_imgs} images...")
         dataset = Subset(dataset, np.random.choice(len(dataset), num_imgs, replace=False))
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=False, collate_fn=collate_fn)
+        
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn)
+    return loader
 
-def pil_imgs_from_folder(folder):
-    """ Get all images in the folder as PIL images """
-    images = []
-    filenames = []
-    for filename in os.listdir(folder):
+def parse_params(param_str: str):
+    """修复后的参数解析函数，能正确处理优化器名称。"""
+    if not param_str:
+        return {}
+    
+    parts = param_str.split(',')
+    
+    # 第一个部分如果没带'='，就认为是优化器名字
+    if '=' not in parts[0]:
+        name = parts[0]
+        params_dict = {'name': name}
+        parts = parts[1:]
+    else: # 兼容老格式或者第一个就是带等号的参数
+        params_dict = {}
+
+    for p in parts:
+        key, val = p.split('=')
+        params_dict[key] = val
+            
+    return params_dict
+
+def get_sha():
+    import subprocess
+    try:
+        sha = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
+        branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).decode('ascii').strip()
+        uncommited_changes = subprocess.check_output(['git', 'status', '--porcelain'])
+        status = 'has uncommited changes' if uncommited_changes else 'clean'
+        return f'sha: {sha}, status: {status}, branch: {branch}'
+    except Exception as e:
+        return 'Not a git repo'
+
+def bool_inst(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+def build_optimizer(model_params, **optim_params):
+    name = optim_params.pop('name')
+    # 类型转换，特别是学习率
+    for k, v in optim_params.items():
         try:
-            img = Image.open(os.path.join(folder,filename))
-            if img is not None:
-                filenames.append(filename)
-                images.append(img)
-        except:
-            print("Error opening image: ", filename)
-    return images, filenames
+            optim_params[k] = float(v)
+        except ValueError:
+            pass
+    return getattr(torch.optim, name)([p for p in model_params if p.requires_grad], **optim_params)
 
-### Metric logging
+def adjust_learning_rate(optimizer, ii, steps, warmup_steps, base_lr):
+    if ii < warmup_steps:
+        lr = base_lr * (ii + 1) / warmup_steps
+    else:
+        # Cosine decay schedule
+        progress = (ii - warmup_steps) / (steps - warmup_steps)
+        lr = base_lr * 0.5 * (1. + np.cos(np.pi * progress))
+    
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
+# From https://github.com/facebookresearch/deit/blob/main/utils.py
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
@@ -119,8 +157,8 @@ class SmoothedValue(object):
 
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
-            fmt = "{median:.6f} ({global_avg:.6f})"
-        self.deque = deque(maxlen=window_size)
+            fmt = "{median:.4f} ({global_avg:.4f})"
+        self.deque =_deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
         self.fmt = fmt
@@ -160,9 +198,11 @@ class SmoothedValue(object):
             max=self.max,
             value=self.value)
 
+from collections import deque as _deque
+
 class MetricLogger(object):
     def __init__(self, delimiter="\t"):
-        self.meters = defaultdict(SmoothedValue)
+        self.meters = {}
         self.delimiter = delimiter
 
     def update(self, **kwargs):
@@ -170,6 +210,8 @@ class MetricLogger(object):
             if isinstance(v, torch.Tensor):
                 v = v.item()
             assert isinstance(v, (float, int))
+            if k not in self.meters:
+                self.meters[k] = SmoothedValue(window_size=20, fmt='{value:.6f}')
             self.meters[k].update(v)
 
     def __getattr__(self, attr):
@@ -187,9 +229,6 @@ class MetricLogger(object):
                 "{}: {}".format(name, str(meter))
             )
         return self.delimiter.join(loss_str)
-
-    def add_meter(self, name, meter):
-        self.meters[name] = meter
 
     def log_every(self, iterable, print_freq, header=None):
         i = 0
@@ -242,35 +281,5 @@ class MetricLogger(object):
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{} Total time: {} ({:.6f} s / it)'.format(header, total_time_str, total_time / (len(iterable)+1)))
-
-### Misc 
-
-def bool_inst(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise ValueError('Boolean value expected in args')
-
-def get_sha():
-    cwd = os.path.dirname(os.path.abspath(__file__))
-
-    def _run(command):
-        return subprocess.check_output(command, cwd=cwd).decode('ascii').strip()
-    sha = 'N/A'
-    diff = "clean"
-    branch = 'N/A'
-    try:
-        sha = _run(['git', 'rev-parse', 'HEAD'])
-        subprocess.check_output(['git', 'diff'], cwd=cwd)
-        diff = _run(['git', 'diff-index', 'HEAD'])
-        diff = "has uncommited changes" if diff else "clean"
-        branch = _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])
-    except Exception:
-        pass
-    message = f"sha: {sha}, status: {diff}, branch: {branch}"
-    return message
+        print('{} Total time: {} ({:.6f} s / it)'.format(
+            header, total_time_str, total_time / len(iterable)))
