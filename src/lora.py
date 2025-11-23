@@ -8,7 +8,7 @@ import math
 
 class LoRALayer(nn.Module):
     # (这个类保持不变，但为了完整性，我们把它留在这里)
-    def __init__(self, in_features, out_features, rank=32, alpha=64):
+    def __init__(self, in_features, out_features, rank=64, alpha=128):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -44,7 +44,7 @@ class LoRAConv2d(nn.Module):
     一个 LoRA 包装器，用于 nn.Conv2d。
     它使用两个卷积层（一个 down-sample，一个 up-sample）来实现 LoRA。
     """
-    def __init__(self, conv_module: nn.Conv2d, rank=32, alpha=64):
+    def __init__(self, conv_module: nn.Conv2d, rank=64, alpha=128):
         super().__init__()
         self.conv = conv_module  # 原始的、将被冻结的卷积层
         self.rank = rank
